@@ -5,340 +5,391 @@ import numpy as np
 import platform
 import time
 
-# Platform-specific volume control imports
-system = platform.system()
-if system == "Windows":
+# Check what OS we're running on and import the right libraries
+current_os = platform.system()
+if current_os == "Windows":
     try:
         from ctypes import cast, POINTER
         from comtypes import CLSCTX_ALL
         from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-        WINDOWS_VOLUME = True
+        windows_audio_available = True
     except ImportError:
-        print("pycaw not installed. Install with: pip install pycaw")
-        WINDOWS_VOLUME = False
-elif system == "Darwin":  # macOS
+        print("Warning: pycaw not installed. Run 'pip install pycaw' for Windows volume control")
+        windows_audio_available = False
+elif current_os == "Darwin":  # macOS
     import os
-    WINDOWS_VOLUME = False
-elif system == "Linux":
+    windows_audio_available = False
+elif current_os == "Linux":
     import subprocess
-    WINDOWS_VOLUME = False
+    windows_audio_available = False
 
-class GestureVolumeController:
+class HandGestureVolumeControl:
     def __init__(self):
-        # Initialize MediaPipe hands
+        # Set up MediaPipe for hand tracking
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=1,
+            max_num_hands=1,  # Only track one hand to avoid confusion
             min_detection_confidence=0.7,
             min_tracking_confidence=0.5
         )
-        self.mp_draw = mp.solutions.drawing_utils
+        self.mp_drawing = mp.solutions.drawing_utils
         
-        # Initialize webcam with fallback options
-        self.cap = None
-        for i in range(3):  # Try camera indices 0, 1, 2
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                if ret:
-                    self.cap = cap
-                    print(f"Camera {i} initialized successfully")
-                    break
-                cap.release()
+        # Try to find and connect to a working camera
+        self.camera = None
+        self._initialize_camera()
         
-        if self.cap is None:
-            print("No camera found or permission denied!")
-            print("Please check camera permissions in System Settings > Privacy & Security > Camera")
+        if self.camera is None:
+            print("ERROR: No working camera found!")
+            print("Check that your camera is connected and permissions are granted")
             return
             
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # Set up reasonable video resolution
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
-        # Volume control setup
-        self.setup_volume_control()
+        # Initialize volume control for the current OS
+        self._setup_volume_control()
         
-        # Variables for smooth volume control
-        self.min_distance = 30
-        self.max_distance = 200
-        # Get current system volume as starting point instead of hardcoded 50
-        self.current_volume = self.get_current_volume()
-        self.volume_smoothing = 0.2  # Increased for faster response
+        # These control how sensitive the gesture detection is
+        self.closest_distance = 30    # Minimum finger distance (volume = 0%)
+        self.farthest_distance = 200  # Maximum finger distance (volume = 100%)
         
-        # FPS calculation
-        self.fps = 0
-        self.prev_time = 0
+        # Start with the current system volume instead of a fixed value
+        self.current_volume_level = self._get_system_volume()
+        self.smoothing_factor = 0.2  # How fast volume changes (0.1 = slow, 0.5 = fast)
         
-    def setup_volume_control(self):
-        """Setup volume control based on operating system"""
-        if system == "Windows" and WINDOWS_VOLUME:
+        # For calculating FPS display
+        self.frame_rate = 0
+        self.last_frame_time = 0
+        
+    def _initialize_camera(self):
+        """Try different camera indices to find one that works"""
+        for camera_index in range(3):  # Check cameras 0, 1, 2
+            test_cap = cv2.VideoCapture(camera_index)
+            if test_cap.isOpened():
+                # Test if we can actually read frames
+                success, test_frame = test_cap.read()
+                if success:
+                    self.camera = test_cap
+                    print(f"Successfully connected to camera {camera_index}")
+                    return
+                test_cap.release()
+        
+    def _setup_volume_control(self):
+        """Initialize volume control based on the operating system"""
+        if current_os == "Windows" and windows_audio_available:
             try:
-                devices = AudioUtilities.GetSpeakers()
-                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                self.volume = cast(interface, POINTER(IAudioEndpointVolume))
-                self.min_vol, self.max_vol = self.volume.GetVolumeRange()[:2]
-                print("Windows volume control initialized")
-            except Exception as e:
-                print(f"Error initializing Windows volume: {e}")
-                self.volume = None
+                # Get the default audio device
+                audio_devices = AudioUtilities.GetSpeakers()
+                audio_interface = audio_devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                self.volume_controller = cast(audio_interface, POINTER(IAudioEndpointVolume))
+                
+                # Get the volume range (usually around -65 to 0 dB)
+                self.min_volume_db, self.max_volume_db = self.volume_controller.GetVolumeRange()[:2]
+                print(f"Windows audio control ready (range: {self.min_volume_db:.1f} to {self.max_volume_db:.1f} dB)")
+            except Exception as error:
+                print(f"Failed to initialize Windows volume control: {error}")
+                self.volume_controller = None
         else:
-            self.volume = None
-            print(f"{system} volume control initialized")
+            self.volume_controller = None
+            print(f"Volume control ready for {current_os}")
     
-    def get_current_volume(self):
-        """Get current system volume as percentage"""
+    def _get_system_volume(self):
+        """Read the current system volume level"""
         try:
-            if system == "Windows" and self.volume:
-                current_vol = self.volume.GetMasterVolumeLevel()
-                percentage = ((current_vol - self.min_vol) / (self.max_vol - self.min_vol)) * 100
-                return max(0, min(100, percentage))
-            elif system == "Darwin":  # macOS
+            if current_os == "Windows" and self.volume_controller:
+                # Convert dB level to percentage
+                current_db = self.volume_controller.GetMasterVolumeLevel()
+                volume_percentage = ((current_db - self.min_volume_db) / 
+                                   (self.max_volume_db - self.min_volume_db)) * 100
+                return max(0, min(100, volume_percentage))
+            elif current_os == "Darwin":  # macOS
+                # Use AppleScript to get volume
                 result = os.popen("osascript -e 'output volume of (get volume settings)'").read().strip()
                 return float(result) if result.isdigit() else 50
-            elif system == "Linux":
+            elif current_os == "Linux":
+                # Use amixer to get ALSA volume
                 result = subprocess.run(['amixer', '-D', 'pulse', 'sget', 'Master'], 
                                       capture_output=True, text=True)
-                # Parse amixer output to get volume percentage
+                # Parse the output to find volume percentage
                 import re
-                match = re.search(r'\[(\d+)%\]', result.stdout)
-                return float(match.group(1)) if match else 50
-        except Exception as e:
-            print(f"Error getting current volume: {e}")
-        return 50  # Default fallback
+                volume_match = re.search(r'\[(\d+)%\]', result.stdout)
+                return float(volume_match.group(1)) if volume_match else 50
+        except Exception as error:
+            print(f"Couldn't read system volume: {error}")
+        
+        return 50  # Safe default if we can't read the volume
     
-    def set_volume(self, percentage):
-        """Set system volume based on percentage (0-100)"""
+    def _change_system_volume(self, percentage):
+        """Set the system volume to a specific percentage"""
         try:
-            if system == "Windows" and self.volume:
-                # Convert percentage to Windows volume range
-                vol_level = self.min_vol + (self.max_vol - self.min_vol) * (percentage / 100)
-                self.volume.SetMasterVolumeLevel(vol_level, None)
-            elif system == "Darwin":  # macOS
+            if current_os == "Windows" and self.volume_controller:
+                # Convert percentage back to dB
+                db_level = self.min_volume_db + (self.max_volume_db - self.min_volume_db) * (percentage / 100)
+                self.volume_controller.SetMasterVolumeLevel(db_level, None)
+            elif current_os == "Darwin":  # macOS
+                # Use AppleScript to set volume
                 os.system(f"osascript -e 'set volume output volume {int(percentage)}'")
-            elif system == "Linux":
+            elif current_os == "Linux":
+                # Use amixer to set ALSA volume
                 subprocess.run(['amixer', '-D', 'pulse', 'sset', 'Master', f'{int(percentage)}%'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            print(f"Error setting volume: {e}")
+        except Exception as error:
+            print(f"Failed to set volume: {error}")
     
-    def calculate_distance(self, point1, point2):
-        """Calculate Euclidean distance between two points"""
+    def _calculate_finger_distance(self, point1, point2):
+        """Calculate the pixel distance between two finger positions"""
         return math.sqrt((point2[0] - point1[0])**2 + (point2[1] - point1[1])**2)
     
-    def draw_volume_bar(self, img, volume_percent):
-        """Draw volume bar on the image"""
-        bar_x, bar_y = 50, 50
-        bar_width, bar_height = 200, 20
+    def _draw_volume_indicator(self, frame, volume_level):
+        """Draw a volume bar on the screen"""
+        # Volume bar dimensions and position
+        bar_left = 50
+        bar_top = 50
+        bar_width = 200
+        bar_height = 20
         
-        # Background bar
-        cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), 
-                      (50, 50, 50), -1)
+        # Draw the background bar (gray)
+        cv2.rectangle(frame, (bar_left, bar_top), 
+                     (bar_left + bar_width, bar_top + bar_height), 
+                     (50, 50, 50), -1)
         
-        # Volume bar
-        fill_width = int(bar_width * volume_percent / 100)
-        color = (0, 255, 0) if volume_percent > 20 else (0, 165, 255)
-        cv2.rectangle(img, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), 
-                      color, -1)
+        # Draw the filled portion based on volume level
+        fill_width = int(bar_width * volume_level / 100)
+        bar_color = (0, 255, 0) if volume_level > 20 else (0, 165, 255)  # Green or orange
+        cv2.rectangle(frame, (bar_left, bar_top), 
+                     (bar_left + fill_width, bar_top + bar_height), 
+                     bar_color, -1)
         
-        # Volume text
-        cv2.putText(img, f'Volume: {int(volume_percent)}%', (bar_x, bar_y - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # Add text showing the exact percentage
+        cv2.putText(frame, f'Volume: {int(volume_level)}%', 
+                   (bar_left, bar_top - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
-    def draw_distance_indicator(self, img, distance, x1, y1, x2, y2):
-        """Draw distance indicator between fingers"""
-        # Line between fingers
-        cv2.line(img, (x1, y1), (x2, y2), (255, 0, 255), 3)
+    def _draw_finger_tracking(self, frame, distance, thumb_x, thumb_y, index_x, index_y):
+        """Draw visual feedback for finger tracking"""
+        # Draw line between the two fingers
+        cv2.line(frame, (thumb_x, thumb_y), (index_x, index_y), (255, 0, 255), 3)
         
-        # Circles on finger tips
-        cv2.circle(img, (x1, y1), 10, (255, 0, 0), -1)  # Thumb
-        cv2.circle(img, (x2, y2), 10, (0, 255, 0), -1)  # Index
+        # Draw circles on the fingertips
+        cv2.circle(frame, (thumb_x, thumb_y), 10, (255, 0, 0), -1)      # Blue for thumb
+        cv2.circle(frame, (index_x, index_y), 10, (0, 255, 0), -1)     # Green for index
         
-        # Distance text
-        mid_x, mid_y = (x1 + x2) // 2, (y1 + y2) // 2
-        cv2.putText(img, f'{int(distance)}px', (mid_x - 30, mid_y - 20), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        # Show the distance in the middle of the line
+        middle_x = (thumb_x + index_x) // 2
+        middle_y = (thumb_y + index_y) // 2
+        cv2.putText(frame, f'{int(distance)}px', 
+                   (middle_x - 30, middle_y - 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
     
-    def process_frame(self):
-        """Process a single frame from webcam"""
-        ret, img = self.cap.read()
-        if not ret:
+    def _process_video_frame(self):
+        """Process one frame from the camera"""
+        success, frame = self.camera.read()
+        if not success:
             return None
         
-        # Flip image horizontally for mirror effect
-        img = cv2.flip(img, 1)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # Flip horizontally so it acts like a mirror
+        frame = cv2.flip(frame, 1)
         
-        # Process hands
-        results = self.hands.process(img_rgb)
+        # Convert BGR to RGB for MediaPipe
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
-                # Draw hand landmarks
-                self.mp_draw.draw_landmarks(img, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+        # Look for hands in the frame
+        hand_results = self.hands.process(rgb_frame)
+        
+        if hand_results.multi_hand_landmarks:
+            for hand_landmarks in hand_results.multi_hand_landmarks:
+                # Draw all the hand connections
+                self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
                 
-                # Get landmark positions
-                landmark_list = []
-                for id, lm in enumerate(hand_landmarks.landmark):
-                    h, w, c = img.shape
-                    cx, cy = int(lm.x * w), int(lm.y * h)
-                    landmark_list.append([id, cx, cy])
+                # Extract the landmark positions
+                landmarks = []
+                for landmark_id, landmark in enumerate(hand_landmarks.landmark):
+                    # Convert from normalized coordinates to pixel coordinates
+                    height, width, _ = frame.shape
+                    pixel_x = int(landmark.x * width)
+                    pixel_y = int(landmark.y * height)
+                    landmarks.append([landmark_id, pixel_x, pixel_y])
                 
-                if len(landmark_list) >= 9:
-                    # Get thumb tip (4) and index finger tip (8)
-                    thumb_tip = landmark_list[4]
-                    index_tip = landmark_list[8]
+                # We need at least 9 landmarks to get thumb and index finger
+                if len(landmarks) >= 9:
+                    # Get thumb tip (landmark 4) and index finger tip (landmark 8)
+                    thumb_tip = landmarks[4]
+                    index_tip = landmarks[8]
                     
-                    x1, y1 = thumb_tip[1], thumb_tip[2]
-                    x2, y2 = index_tip[1], index_tip[2]
+                    thumb_x, thumb_y = thumb_tip[1], thumb_tip[2]
+                    index_x, index_y = index_tip[1], index_tip[2]
                     
-                    # Calculate distance
-                    distance = self.calculate_distance((x1, y1), (x2, y2))
+                    # Calculate distance between fingertips
+                    finger_distance = self._calculate_finger_distance(
+                        (thumb_x, thumb_y), (index_x, index_y)
+                    )
                     
-                    # Map distance to volume (0-100)
-                    target_volume = np.interp(distance, 
-                                            [self.min_distance, self.max_distance], 
+                    # Map the distance to a volume percentage
+                    target_volume = np.interp(finger_distance, 
+                                            [self.closest_distance, self.farthest_distance], 
                                             [0, 100])
-                    target_volume = max(0, min(100, target_volume))
+                    target_volume = max(0, min(100, target_volume))  # Clamp to 0-100
                     
-                    # Smooth volume changes
-                    self.current_volume = (self.current_volume * (1 - self.volume_smoothing) + 
-                                         target_volume * self.volume_smoothing)
+                    # Apply smoothing to avoid jumpy volume changes
+                    self.current_volume_level = (
+                        self.current_volume_level * (1 - self.smoothing_factor) + 
+                        target_volume * self.smoothing_factor
+                    )
                     
-                    # Set system volume
-                    self.set_volume(self.current_volume)
+                    # Actually change the system volume
+                    self._change_system_volume(self.current_volume_level)
                     
-                    # Draw visual indicators
-                    self.draw_distance_indicator(img, distance, x1, y1, x2, y2)
+                    # Draw the visual feedback
+                    self._draw_finger_tracking(frame, finger_distance, thumb_x, thumb_y, index_x, index_y)
                     
-                    # Debug info
-                    cv2.putText(img, f'Distance: {int(distance)}', (10, 100), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    cv2.putText(img, f'Target: {int(target_volume)}%', (10, 120), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    # Show debug information
+                    cv2.putText(frame, f'Distance: {int(finger_distance)}px', 
+                               (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, f'Target: {int(target_volume)}%', 
+                               (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     
-        # Draw volume bar
-        self.draw_volume_bar(img, self.current_volume)
+        # Always draw the volume bar
+        self._draw_volume_indicator(frame, self.current_volume_level)
         
-        # Calculate and display FPS
+        # Calculate and show FPS
         current_time = time.time()
-        self.fps = 1 / (current_time - self.prev_time) if self.prev_time > 0 else 0
-        self.prev_time = current_time
+        if self.last_frame_time > 0:
+            self.frame_rate = 1.0 / (current_time - self.last_frame_time)
+        self.last_frame_time = current_time
         
-        cv2.putText(img, f'FPS: {int(self.fps)}', (img.shape[1] - 100, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f'FPS: {int(self.frame_rate)}', 
+                   (frame.shape[1] - 100, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # Instructions
-        cv2.putText(img, 'Bring thumb and index finger closer/farther to control volume', 
-                    (10, img.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(img, 'Press Q to quit, R to reset, C to calibrate', 
-                    (10, img.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(img, f'Range: {self.min_distance}-{self.max_distance}px', 
-                    (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Add instructions for the user
+        cv2.putText(frame, 'Pinch thumb and index finger together/apart to control volume', 
+                   (10, frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, 'Press Q=quit, R=reset volume, C=calibrate range', 
+                   (10, frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, f'Detection range: {self.closest_distance}-{self.farthest_distance} pixels', 
+                   (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        return img
+        return frame
     
-    def calibrate_range(self):
-        """Calibrate the min/max distance range"""
-        print("\nCalibration Mode:")
-        print("1. Make the smallest distance with your fingers and press 'S'")
-        print("2. Make the largest distance with your fingers and press 'L'")
-        print("3. Press 'D' when done")
+    def _calibrate_detection_range(self):
+        """Let the user calibrate the min/max finger distances"""
+        print("\n=== CALIBRATION MODE ===")
+        print("Step 1: Put your fingers as CLOSE as possible, then press 'S' to set minimum")
+        print("Step 2: Put your fingers as FAR as possible, then press 'L' to set maximum")
+        print("Step 3: Press 'D' when you're done calibrating")
         
         calibrating = True
         while calibrating:
-            ret, img = self.cap.read()
-            if not ret:
+            success, frame = self.camera.read()
+            if not success:
                 break
                 
-            img = cv2.flip(img, 1)
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            results = self.hands.process(img_rgb)
+            frame = cv2.flip(frame, 1)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            hand_results = self.hands.process(rgb_frame)
             
             current_distance = 0
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    self.mp_draw.draw_landmarks(img, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+            if hand_results.multi_hand_landmarks:
+                for hand_landmarks in hand_results.multi_hand_landmarks:
+                    self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
                     
-                    landmark_list = []
-                    for id, lm in enumerate(hand_landmarks.landmark):
-                        h, w, c = img.shape
-                        cx, cy = int(lm.x * w), int(lm.y * h)
-                        landmark_list.append([id, cx, cy])
+                    landmarks = []
+                    for landmark_id, landmark in enumerate(hand_landmarks.landmark):
+                        height, width, _ = frame.shape
+                        pixel_x = int(landmark.x * width)
+                        pixel_y = int(landmark.y * height)
+                        landmarks.append([landmark_id, pixel_x, pixel_y])
                     
-                    if len(landmark_list) >= 9:
-                        thumb_tip = landmark_list[4]
-                        index_tip = landmark_list[8]
-                        x1, y1 = thumb_tip[1], thumb_tip[2]
-                        x2, y2 = index_tip[1], index_tip[2]
-                        current_distance = self.calculate_distance((x1, y1), (x2, y2))
-                        self.draw_distance_indicator(img, current_distance, x1, y1, x2, y2)
+                    if len(landmarks) >= 9:
+                        thumb_tip = landmarks[4]
+                        index_tip = landmarks[8]
+                        thumb_x, thumb_y = thumb_tip[1], thumb_tip[2]
+                        index_x, index_y = index_tip[1], index_tip[2]
+                        current_distance = self._calculate_finger_distance((thumb_x, thumb_y), (index_x, index_y))
+                        self._draw_finger_tracking(frame, current_distance, thumb_x, thumb_y, index_x, index_y)
             
-            # Display calibration info
-            cv2.putText(img, 'CALIBRATION MODE', (200, 50), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-            cv2.putText(img, f'Current Distance: {int(current_distance)}', (10, 100), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(img, f'Min Distance: {self.min_distance}', (10, 130), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(img, f'Max Distance: {self.max_distance}', (10, 160), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            # Show calibration status
+            cv2.putText(frame, '=== CALIBRATION MODE ===', 
+                       (150, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            cv2.putText(frame, f'Current distance: {int(current_distance)} pixels', 
+                       (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(frame, f'Minimum distance: {self.closest_distance} pixels', 
+                       (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(frame, f'Maximum distance: {self.farthest_distance} pixels', 
+                       (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
-            cv2.imshow('Gesture Volume Control', img)
+            cv2.imshow('Hand Gesture Volume Control', frame)
             
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('s'):
-                self.min_distance = max(10, int(current_distance))
-                print(f"Min distance set to: {self.min_distance}")
-            elif key == ord('l'):
-                self.max_distance = max(self.min_distance + 50, int(current_distance))
-                print(f"Max distance set to: {self.max_distance}")
-            elif key == ord('d'):
+            key_pressed = cv2.waitKey(1) & 0xFF
+            if key_pressed == ord('s'):
+                # Set minimum distance (add small buffer to avoid zero)
+                self.closest_distance = max(10, int(current_distance))
+                print(f"Minimum distance set to: {self.closest_distance} pixels")
+            elif key_pressed == ord('l'):
+                # Set maximum distance (ensure it's bigger than minimum)
+                self.farthest_distance = max(self.closest_distance + 50, int(current_distance))
+                print(f"Maximum distance set to: {self.farthest_distance} pixels")
+            elif key_pressed == ord('d'):
                 calibrating = False
-                print("Calibration complete!")
+                print("Calibration finished! You can now control volume with gestures.")
     
-    def run(self):
-        """Main loop"""
-        if self.cap is None:
+    def start_gesture_control(self):
+        """Main loop that processes video and controls volume"""
+        if self.camera is None:
             print("Cannot start - no camera available")
             return
             
-        print("Starting Gesture Volume Control...")
+        print("\n=== Hand Gesture Volume Control Started ===")
         print("Hold your hand in front of the camera")
-        print("Move your thumb and index finger closer/farther to control volume")
-        print("Press 'q' to quit, 'r' to reset, 'c' to calibrate")
+        print("Pinch your thumb and index finger together/apart to control volume")
+        print("Available commands:")
+        print("  Q = Quit the program")
+        print("  R = Reset to current system volume")
+        print("  C = Calibrate finger distance range")
+        print()
         
         while True:
-            img = self.process_frame()
-            if img is None:
+            frame = self._process_video_frame()
+            if frame is None:
                 break
                 
-            cv2.imshow('Gesture Volume Control', img)
+            cv2.imshow('Hand Gesture Volume Control', frame)
             
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            key_pressed = cv2.waitKey(1) & 0xFF
+            if key_pressed == ord('q'):
+                print("Quitting...")
                 break
-            elif key == ord('r'):  # Reset to current system volume
-                self.current_volume = self.get_current_volume()
-                print(f"Volume reset to current system volume: {int(self.current_volume)}%")
-            elif key == ord('c'):  # Calibrate distance range
-                self.calibrate_range()
+            elif key_pressed == ord('r'):
+                # Reset to current system volume
+                self.current_volume_level = self._get_system_volume()
+                print(f"Volume reset to system level: {int(self.current_volume_level)}%")
+            elif key_pressed == ord('c'):
+                # Enter calibration mode
+                self._calibrate_detection_range()
     
     def cleanup(self):
-        """Clean up resources"""
-        self.cap.release()
+        """Clean up camera and windows"""
+        if self.camera:
+            self.camera.release()
         cv2.destroyAllWindows()
-        print("Cleanup completed")
+        print("Cleanup complete")
 
 def main():
-    controller = GestureVolumeController()
+    # Create the gesture controller
+    gesture_controller = HandGestureVolumeControl()
+    
     try:
-        controller.run()
+        # Start the main control loop
+        gesture_controller.start_gesture_control()
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    except Exception as e:
-        print(f"Error: {e}")
+        print("\nProgram interrupted by user (Ctrl+C)")
+    except Exception as error:
+        print(f"An error occurred: {error}")
     finally:
-        controller.cleanup()
+        # Always clean up resources
+        gesture_controller.cleanup()
 
 if __name__ == "__main__":
     main()
