@@ -61,8 +61,9 @@ class GestureVolumeController:
         # Variables for smooth volume control
         self.min_distance = 30
         self.max_distance = 200
-        self.current_volume = 50
-        self.volume_smoothing = 0.1
+        # Get current system volume as starting point instead of hardcoded 50
+        self.current_volume = self.get_current_volume()
+        self.volume_smoothing = 0.2  # Increased for faster response
         
         # FPS calculation
         self.fps = 0
@@ -83,6 +84,27 @@ class GestureVolumeController:
         else:
             self.volume = None
             print(f"{system} volume control initialized")
+    
+    def get_current_volume(self):
+        """Get current system volume as percentage"""
+        try:
+            if system == "Windows" and self.volume:
+                current_vol = self.volume.GetMasterVolumeLevel()
+                percentage = ((current_vol - self.min_vol) / (self.max_vol - self.min_vol)) * 100
+                return max(0, min(100, percentage))
+            elif system == "Darwin":  # macOS
+                result = os.popen("osascript -e 'output volume of (get volume settings)'").read().strip()
+                return float(result) if result.isdigit() else 50
+            elif system == "Linux":
+                result = subprocess.run(['amixer', '-D', 'pulse', 'sget', 'Master'], 
+                                      capture_output=True, text=True)
+                # Parse amixer output to get volume percentage
+                import re
+                match = re.search(r'\[(\d+)%\]', result.stdout)
+                return float(match.group(1)) if match else 50
+        except Exception as e:
+            print(f"Error getting current volume: {e}")
+        return 50  # Default fallback
     
     def set_volume(self, percentage):
         """Set system volume based on percentage (0-100)"""
@@ -173,20 +195,26 @@ class GestureVolumeController:
                     distance = self.calculate_distance((x1, y1), (x2, y2))
                     
                     # Map distance to volume (0-100)
-                    volume_percent = np.interp(distance, 
-                                             [self.min_distance, self.max_distance], 
-                                             [0, 100])
-                    volume_percent = max(0, min(100, volume_percent))
+                    target_volume = np.interp(distance, 
+                                            [self.min_distance, self.max_distance], 
+                                            [0, 100])
+                    target_volume = max(0, min(100, target_volume))
                     
                     # Smooth volume changes
                     self.current_volume = (self.current_volume * (1 - self.volume_smoothing) + 
-                                         volume_percent * self.volume_smoothing)
+                                         target_volume * self.volume_smoothing)
                     
                     # Set system volume
                     self.set_volume(self.current_volume)
                     
                     # Draw visual indicators
                     self.draw_distance_indicator(img, distance, x1, y1, x2, y2)
+                    
+                    # Debug info
+                    cv2.putText(img, f'Distance: {int(distance)}', (10, 100), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(img, f'Target: {int(target_volume)}%', (10, 120), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     
         # Draw volume bar
         self.draw_volume_bar(img, self.current_volume)
@@ -201,11 +229,72 @@ class GestureVolumeController:
         
         # Instructions
         cv2.putText(img, 'Bring thumb and index finger closer/farther to control volume', 
+                    (10, img.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(img, 'Press Q to quit, R to reset, C to calibrate', 
                     (10, img.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(img, 'Press Q to quit', (10, img.shape[0] - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(img, f'Range: {self.min_distance}-{self.max_distance}px', 
+                    (10, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return img
+    
+    def calibrate_range(self):
+        """Calibrate the min/max distance range"""
+        print("\nCalibration Mode:")
+        print("1. Make the smallest distance with your fingers and press 'S'")
+        print("2. Make the largest distance with your fingers and press 'L'")
+        print("3. Press 'D' when done")
+        
+        calibrating = True
+        while calibrating:
+            ret, img = self.cap.read()
+            if not ret:
+                break
+                
+            img = cv2.flip(img, 1)
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = self.hands.process(img_rgb)
+            
+            current_distance = 0
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    self.mp_draw.draw_landmarks(img, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                    
+                    landmark_list = []
+                    for id, lm in enumerate(hand_landmarks.landmark):
+                        h, w, c = img.shape
+                        cx, cy = int(lm.x * w), int(lm.y * h)
+                        landmark_list.append([id, cx, cy])
+                    
+                    if len(landmark_list) >= 9:
+                        thumb_tip = landmark_list[4]
+                        index_tip = landmark_list[8]
+                        x1, y1 = thumb_tip[1], thumb_tip[2]
+                        x2, y2 = index_tip[1], index_tip[2]
+                        current_distance = self.calculate_distance((x1, y1), (x2, y2))
+                        self.draw_distance_indicator(img, current_distance, x1, y1, x2, y2)
+            
+            # Display calibration info
+            cv2.putText(img, 'CALIBRATION MODE', (200, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            cv2.putText(img, f'Current Distance: {int(current_distance)}', (10, 100), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(img, f'Min Distance: {self.min_distance}', (10, 130), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(img, f'Max Distance: {self.max_distance}', (10, 160), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            cv2.imshow('Gesture Volume Control', img)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('s'):
+                self.min_distance = max(10, int(current_distance))
+                print(f"Min distance set to: {self.min_distance}")
+            elif key == ord('l'):
+                self.max_distance = max(self.min_distance + 50, int(current_distance))
+                print(f"Max distance set to: {self.max_distance}")
+            elif key == ord('d'):
+                calibrating = False
+                print("Calibration complete!")
     
     def run(self):
         """Main loop"""
@@ -216,7 +305,7 @@ class GestureVolumeController:
         print("Starting Gesture Volume Control...")
         print("Hold your hand in front of the camera")
         print("Move your thumb and index finger closer/farther to control volume")
-        print("Press 'q' to quit")
+        print("Press 'q' to quit, 'r' to reset, 'c' to calibrate")
         
         while True:
             img = self.process_frame()
@@ -228,10 +317,11 @@ class GestureVolumeController:
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord('r'):  # Reset calibration
-                self.current_volume = 50
-                self.set_volume(50)
-                print("Volume reset to 50%")
+            elif key == ord('r'):  # Reset to current system volume
+                self.current_volume = self.get_current_volume()
+                print(f"Volume reset to current system volume: {int(self.current_volume)}%")
+            elif key == ord('c'):  # Calibrate distance range
+                self.calibrate_range()
     
     def cleanup(self):
         """Clean up resources"""
@@ -251,4 +341,4 @@ def main():
         controller.cleanup()
 
 if __name__ == "__main__":
-    main() 
+    main()
