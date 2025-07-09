@@ -63,6 +63,12 @@ class HandGestureVolumeControl:
         self.frame_rate = 0
         self.last_frame_time = 0
         
+        # Performance optimization variables
+        self.last_volume_set = 0
+        self.volume_update_threshold = 1.0  # Only update volume if change is > 1%
+        self.last_volume_update_time = 0
+        self.volume_update_interval = 0.05  # Update volume max every 50ms
+        
     def _initialize_camera(self):
         """Try different camera indices to find one that works"""
         for camera_index in range(3):  # Check cameras 0, 1, 2
@@ -122,7 +128,14 @@ class HandGestureVolumeControl:
         return 50  # Safe default if we can't read the volume
     
     def _change_system_volume(self, percentage):
-        """Set the system volume to a specific percentage"""
+        """Set the system volume to a specific percentage (with throttling)"""
+        current_time = time.time()
+        
+        # Throttle volume updates to reduce system calls
+        if (current_time - self.last_volume_update_time < self.volume_update_interval or
+            abs(percentage - self.last_volume_set) < self.volume_update_threshold):
+            return
+            
         try:
             if current_os == "Windows" and self.volume_controller:
                 # Convert percentage back to dB
@@ -135,12 +148,18 @@ class HandGestureVolumeControl:
                 # Use amixer to set ALSA volume
                 subprocess.run(['amixer', '-D', 'pulse', 'sset', 'Master', f'{int(percentage)}%'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            self.last_volume_set = percentage
+            self.last_volume_update_time = current_time
+            
         except Exception as error:
             print(f"Failed to set volume: {error}")
     
     def _calculate_finger_distance(self, point1, point2):
         """Calculate the pixel distance between two finger positions"""
-        return math.sqrt((point2[0] - point1[0])**2 + (point2[1] - point1[1])**2)
+        dx = point2[0] - point1[0]
+        dy = point2[1] - point1[1]
+        return math.sqrt(dx * dx + dy * dy)
     
     def _draw_volume_indicator(self, frame, volume_level):
         """Draw a volume bar on the screen"""
@@ -167,8 +186,11 @@ class HandGestureVolumeControl:
                    (bar_left, bar_top - 10), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
-    def _draw_finger_tracking(self, frame, distance, thumb_x, thumb_y, index_x, index_y):
+    def _draw_finger_tracking(self, frame, distance, thumb_pos, index_pos):
         """Draw visual feedback for finger tracking"""
+        thumb_x, thumb_y = thumb_pos
+        index_x, index_y = index_pos
+        
         # Draw line between the two fingers
         cv2.line(frame, (thumb_x, thumb_y), (index_x, index_y), (255, 0, 255), 3)
         
@@ -198,58 +220,52 @@ class HandGestureVolumeControl:
         # Look for hands in the frame
         hand_results = self.hands.process(rgb_frame)
         
+        finger_distance = 0
+        target_volume = self.current_volume_level
+        
         if hand_results.multi_hand_landmarks:
-            for hand_landmarks in hand_results.multi_hand_landmarks:
-                # Draw all the hand connections
-                self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
-                
-                # Extract the landmark positions
-                landmarks = []
-                for landmark_id, landmark in enumerate(hand_landmarks.landmark):
-                    # Convert from normalized coordinates to pixel coordinates
-                    height, width, _ = frame.shape
-                    pixel_x = int(landmark.x * width)
-                    pixel_y = int(landmark.y * height)
-                    landmarks.append([landmark_id, pixel_x, pixel_y])
-                
-                # We need at least 9 landmarks to get thumb and index finger
-                if len(landmarks) >= 9:
-                    # Get thumb tip (landmark 4) and index finger tip (landmark 8)
-                    thumb_tip = landmarks[4]
-                    index_tip = landmarks[8]
-                    
-                    thumb_x, thumb_y = thumb_tip[1], thumb_tip[2]
-                    index_x, index_y = index_tip[1], index_tip[2]
-                    
-                    # Calculate distance between fingertips
-                    finger_distance = self._calculate_finger_distance(
-                        (thumb_x, thumb_y), (index_x, index_y)
-                    )
-                    
-                    # Map the distance to a volume percentage
-                    target_volume = np.interp(finger_distance, 
-                                            [self.closest_distance, self.farthest_distance], 
-                                            [0, 100])
-                    target_volume = max(0, min(100, target_volume))  # Clamp to 0-100
-                    
-                    # Apply smoothing to avoid jumpy volume changes
-                    self.current_volume_level = (
-                        self.current_volume_level * (1 - self.smoothing_factor) + 
-                        target_volume * self.smoothing_factor
-                    )
-                    
-                    # Actually change the system volume
-                    self._change_system_volume(self.current_volume_level)
-                    
-                    # Draw the visual feedback
-                    self._draw_finger_tracking(frame, finger_distance, thumb_x, thumb_y, index_x, index_y)
-                    
-                    # Show debug information
-                    cv2.putText(frame, f'Distance: {int(finger_distance)}px', 
-                               (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    cv2.putText(frame, f'Target: {int(target_volume)}%', 
-                               (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    
+            # Process only the first hand for better performance
+            hand_landmarks = hand_results.multi_hand_landmarks[0]
+            
+            # Draw hand landmarks (single call)
+            self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+            
+            # Get frame dimensions once
+            height, width = frame.shape[:2]
+            
+            # Extract only the landmarks we need (thumb tip and index tip)
+            thumb_landmark = hand_landmarks.landmark[4]  # Thumb tip
+            index_landmark = hand_landmarks.landmark[8]  # Index tip
+            
+            # Convert to pixel coordinates
+            thumb_x = int(thumb_landmark.x * width)
+            thumb_y = int(thumb_landmark.y * height)
+            index_x = int(index_landmark.x * width)
+            index_y = int(index_landmark.y * height)
+            
+            # Calculate distance between fingertips
+            finger_distance = self._calculate_finger_distance(
+                (thumb_x, thumb_y), (index_x, index_y)
+            )
+            
+            # Map the distance to a volume percentage
+            target_volume = np.interp(finger_distance, 
+                                    [self.closest_distance, self.farthest_distance], 
+                                    [0, 100])
+            target_volume = max(0, min(100, target_volume))  # Clamp to 0-100
+            
+            # Apply smoothing to avoid jumpy volume changes
+            self.current_volume_level = (
+                self.current_volume_level * (1 - self.smoothing_factor) + 
+                target_volume * self.smoothing_factor
+            )
+            
+            # Actually change the system volume (with throttling)
+            self._change_system_volume(self.current_volume_level)
+            
+            # Draw the visual feedback
+            self._draw_finger_tracking(frame, finger_distance, (thumb_x, thumb_y), (index_x, index_y))
+        
         # Always draw the volume bar
         self._draw_volume_indicator(frame, self.current_volume_level)
         
@@ -259,19 +275,30 @@ class HandGestureVolumeControl:
             self.frame_rate = 1.0 / (current_time - self.last_frame_time)
         self.last_frame_time = current_time
         
-        cv2.putText(frame, f'FPS: {int(self.frame_rate)}', 
-                   (frame.shape[1] - 100, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Add instructions for the user
-        cv2.putText(frame, 'Pinch thumb and index finger together/apart to control volume', 
-                   (10, frame.shape[0] - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, 'Press Q=quit, R=reset volume, C=calibrate range', 
-                   (10, frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, f'Detection range: {self.closest_distance}-{self.farthest_distance} pixels', 
-                   (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Combine all text rendering into fewer calls
+        self._draw_ui_text(frame, finger_distance, target_volume)
         
         return frame
+    
+    def _draw_ui_text(self, frame, finger_distance, target_volume):
+        """Draw all UI text in one optimized function"""
+        text_color = (255, 255, 255)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        # FPS in top right
+        cv2.putText(frame, f'FPS: {int(self.frame_rate)}', 
+                   (frame.shape[1] - 100, 30), font, 0.6, text_color, 2)
+        
+        # Only show debug info if hand is detected
+        if finger_distance > 0:
+            cv2.putText(frame, f'Distance: {int(finger_distance)}px | Target: {int(target_volume)}%', 
+                       (10, 100), font, 0.5, text_color, 1)
+        
+        # Instructions at bottom
+        cv2.putText(frame, 'Pinch thumb/index to control volume | Q=quit R=reset C=calibrate', 
+                   (10, frame.shape[0] - 30), font, 0.5, text_color, 1)
+        cv2.putText(frame, f'Range: {self.closest_distance}-{self.farthest_distance}px', 
+                   (10, frame.shape[0] - 10), font, 0.5, text_color, 1)
     
     def _calibrate_detection_range(self):
         """Let the user calibrate the min/max finger distances"""
@@ -292,33 +319,26 @@ class HandGestureVolumeControl:
             
             current_distance = 0
             if hand_results.multi_hand_landmarks:
-                for hand_landmarks in hand_results.multi_hand_landmarks:
-                    self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
-                    
-                    landmarks = []
-                    for landmark_id, landmark in enumerate(hand_landmarks.landmark):
-                        height, width, _ = frame.shape
-                        pixel_x = int(landmark.x * width)
-                        pixel_y = int(landmark.y * height)
-                        landmarks.append([landmark_id, pixel_x, pixel_y])
-                    
-                    if len(landmarks) >= 9:
-                        thumb_tip = landmarks[4]
-                        index_tip = landmarks[8]
-                        thumb_x, thumb_y = thumb_tip[1], thumb_tip[2]
-                        index_x, index_y = index_tip[1], index_tip[2]
-                        current_distance = self._calculate_finger_distance((thumb_x, thumb_y), (index_x, index_y))
-                        self._draw_finger_tracking(frame, current_distance, thumb_x, thumb_y, index_x, index_y)
+                hand_landmarks = hand_results.multi_hand_landmarks[0]
+                self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                
+                height, width = frame.shape[:2]
+                thumb_landmark = hand_landmarks.landmark[4]
+                index_landmark = hand_landmarks.landmark[8]
+                
+                thumb_x = int(thumb_landmark.x * width)
+                thumb_y = int(thumb_landmark.y * height)
+                index_x = int(index_landmark.x * width)
+                index_y = int(index_landmark.y * height)
+                
+                current_distance = self._calculate_finger_distance((thumb_x, thumb_y), (index_x, index_y))
+                self._draw_finger_tracking(frame, current_distance, (thumb_x, thumb_y), (index_x, index_y))
             
             # Show calibration status
             cv2.putText(frame, '=== CALIBRATION MODE ===', 
                        (150, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-            cv2.putText(frame, f'Current distance: {int(current_distance)} pixels', 
+            cv2.putText(frame, f'Current: {int(current_distance)}px | Min: {self.closest_distance}px | Max: {self.farthest_distance}px', 
                        (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(frame, f'Minimum distance: {self.closest_distance} pixels', 
-                       (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(frame, f'Maximum distance: {self.farthest_distance} pixels', 
-                       (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
             cv2.imshow('Hand Gesture Volume Control', frame)
             
